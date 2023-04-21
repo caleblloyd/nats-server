@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -305,6 +306,8 @@ type outbound struct {
 const nbPoolSizeSmall = 4096  // Underlying array size of small buffer
 const nbPoolSizeLarge = 65536 // Underlying array size of large buffer
 
+var nbPoolSmallCtMu = sync.Mutex{}
+var nbPoolSmallCt = map[*[nbPoolSizeSmall]byte]*int64{}
 var nbPoolSmall = &sync.Pool{
 	New: func() any {
 		b := [nbPoolSizeSmall]byte{}
@@ -312,6 +315,8 @@ var nbPoolSmall = &sync.Pool{
 	},
 }
 
+var nbPoolLargeCtMu = sync.Mutex{}
+var nbPoolLargeCt = map[*[nbPoolSizeLarge]byte]*int64{}
 var nbPoolLarge = &sync.Pool{
 	New: func() any {
 		b := [nbPoolSizeLarge]byte{}
@@ -323,9 +328,31 @@ func nbPoolPut(b []byte) {
 	switch cap(b) {
 	case nbPoolSizeSmall:
 		b := (*[nbPoolSizeSmall]byte)(b[0:nbPoolSizeSmall])
+		nbPoolSmallCtMu.Lock()
+		ct, ok := nbPoolSmallCt[b]
+		nbPoolSmallCtMu.Unlock()
+		if ok {
+			if atomic.AddInt64(ct, -1) != 0 {
+				log.Printf("small: double put to %p", b)
+				atomic.AddInt64(ct, 1)
+			}
+		} else {
+			log.Printf("small: put non-existant %p", b)
+		}
 		nbPoolSmall.Put(b)
 	case nbPoolSizeLarge:
 		b := (*[nbPoolSizeLarge]byte)(b[0:nbPoolSizeLarge])
+		nbPoolLargeCtMu.Lock()
+		ct, ok := nbPoolLargeCt[b]
+		nbPoolLargeCtMu.Unlock()
+		if ok {
+			if atomic.AddInt64(ct, -1) < 0 {
+				log.Printf("large: double put to %p", b)
+				atomic.AddInt64(ct, 1)
+			}
+		} else {
+			log.Printf("large: put non-existant %p", b)
+		}
 		nbPoolLarge.Put(b)
 	default:
 		// Ignore frames that are the wrong size, this might happen
@@ -2038,11 +2065,35 @@ func (c *client) queueOutbound(data []byte) {
 			// If the buffer is empty, try to allocate a small buffer if the
 			// message will fit in it. This will help for cases like pings.
 			new = nbPoolSmall.Get().(*[nbPoolSizeSmall]byte)[:0]
+			b := (*[nbPoolSizeSmall]byte)(new[:nbPoolSizeSmall])
+			nbPoolSmallCtMu.Lock()
+			ct, ok := nbPoolSmallCt[b]
+			nbPoolSmallCtMu.Unlock()
+			if ok {
+				atomic.AddInt64(ct, 1)
+			} else {
+				var cti int64 = 1
+				nbPoolSmallCtMu.Lock()
+				nbPoolSmallCt[b] = &cti
+				nbPoolSmallCtMu.Unlock()
+			}
 		} else {
 			// If "nb" isn't empty, default to large buffers in all cases as
 			// this means we are always coalescing future messages into
 			// larger buffers. Reduces the number of buffers into writev.
 			new = nbPoolLarge.Get().(*[nbPoolSizeLarge]byte)[:0]
+			b := (*[nbPoolSizeLarge]byte)(new[:nbPoolSizeLarge])
+			nbPoolLargeCtMu.Lock()
+			ct, ok := nbPoolLargeCt[b]
+			nbPoolLargeCtMu.Unlock()
+			if ok {
+				atomic.AddInt64(ct, 1)
+			} else {
+				var cti int64 = 1
+				nbPoolLargeCtMu.Lock()
+				nbPoolLargeCt[b] = &cti
+				nbPoolLargeCtMu.Unlock()
+			}
 		}
 		l := len(toBuffer)
 		if c := cap(new); l > c {
